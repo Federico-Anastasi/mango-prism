@@ -310,6 +310,7 @@ struct server_chat_params {
     std::string reasoning_budget_message;
     std::string media_path;
     bool force_pure_content = false;
+    bool cache_base = false; // disk cache: the request carries the common prefix text (cache_base_text)
 };
 
 // used by /completions endpoint

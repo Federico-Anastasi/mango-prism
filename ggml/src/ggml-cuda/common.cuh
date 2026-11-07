@@ -275,7 +275,14 @@ static const char * cu_get_error_str(CUresult err) {
 #define VOLTA_MMA_AVAILABLE
 #endif // !defined(GGML_USE_HIP) && __CUDA_ARCH__ == GGML_CUDA_CC_VOLTA
 
-#if !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_TURING
+// mango-code: GGML_CUDA_TU116 = the cc 7.5 device is a TU116/TU117 (GTX 16xx) WITHOUT tensor cores:
+// mma is emulated and 5x slower than dp4a. The mma path is denied to cc 750 only.
+#if defined(GGML_CUDA_TU116)
+#define GGML_CUDA_TU116_ARCH_IS_750 (__CUDA_ARCH__ == GGML_CUDA_CC_TURING)
+#else
+#define GGML_CUDA_TU116_ARCH_IS_750 0
+#endif
+#if !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_TURING && !GGML_CUDA_TU116_ARCH_IS_750
 #define TURING_MMA_AVAILABLE
 #endif // !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_TURING
 
@@ -313,8 +320,16 @@ static bool fast_fp16_hardware_available(const int cc) {
 }
 
 // To be used for feature selection of external libraries, e.g. cuBLAS.
+static bool tu116_no_mma(const int cc) {
+#if defined(GGML_CUDA_TU116)
+    return GGML_CUDA_CC_IS_NVIDIA(cc) && cc == GGML_CUDA_CC_TURING;
+#else
+    GGML_UNUSED(cc); return false;
+#endif
+}
+
 static bool fp16_mma_hardware_available(const int cc) {
-    return (GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_VOLTA) ||
+    return (GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_VOLTA && !tu116_no_mma(cc)) ||
         GGML_CUDA_CC_IS_CDNA(cc) || GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc) ||
         (GGML_CUDA_CC_IS_MTHREADS(cc) && cc >= GGML_CUDA_CC_QY2);
 }
@@ -346,7 +361,7 @@ static bool volta_mma_available(const int cc) {
 }
 
 static bool turing_mma_available(const int cc) {
-    return GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_TURING;
+    return GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_TURING && !tu116_no_mma(cc);
 }
 
 static bool ampere_mma_available(const int cc) {

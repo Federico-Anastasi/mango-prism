@@ -1,3 +1,39 @@
+// mango-code: MMVQ table for Pascal (1080). 1/1 measured on IQ4_XS (b9874); for the ternary types
+// (PQ2_0/PTQ1_0) the sweep must be redone: rebuild with -DMANGO_PASCAL_NWARPS=N -DMANGO_PASCAL_RPB=M.
+#ifndef MANGO_PASCAL_NWARPS
+#define MANGO_PASCAL_NWARPS 1
+#endif
+#ifndef MANGO_PASCAL_RPB
+#define MANGO_PASCAL_RPB 1
+#endif
+// mango-code: decode geometry (ncols_dst = 1) for PQ2_0 ONLY, on older GPUs. The ternary type
+// has 4 weights per byte: the bottleneck is loading the q8_1 activations, which with 1 row per block
+// are reloaded for every row. More rows per block = activations reused. Values from the sweep.
+#ifndef MANGO_PQ2_PASCAL_NW
+#define MANGO_PQ2_PASCAL_NW 2
+#endif
+#ifndef MANGO_PQ2_PASCAL_RPB
+#define MANGO_PQ2_PASCAL_RPB 4
+#endif
+#ifndef MANGO_PQ2_TURING_NW
+#define MANGO_PQ2_TURING_NW 2
+#endif
+#ifndef MANGO_PQ2_TURING_RPB
+#define MANGO_PQ2_TURING_RPB 8
+#endif
+// Batch 2 (two agents generating together): separate geometry.
+#ifndef MANGO_PQ2_PASCAL_NW2
+#define MANGO_PQ2_PASCAL_NW2 4
+#endif
+#ifndef MANGO_PQ2_PASCAL_RPB2
+#define MANGO_PQ2_PASCAL_RPB2 4
+#endif
+#ifndef MANGO_PQ2_TURING_NW2
+#define MANGO_PQ2_TURING_NW2 2
+#endif
+#ifndef MANGO_PQ2_TURING_RPB2
+#define MANGO_PQ2_TURING_RPB2 8
+#endif
 #include "mmvq.cuh"
 #include "quantize.cuh"
 #include "unary.cuh"
@@ -71,6 +107,7 @@ static constexpr __host__ __device__ int get_vdr_mmvq(ggml_type type) {
 enum mmvq_parameter_table_id {
     MMVQ_PARAMETERS_GENERIC = 0,
     MMVQ_PARAMETERS_TURING,
+    MMVQ_PARAMETERS_PASCAL, // mango-code
     MMVQ_PARAMETERS_GCN,
     MMVQ_PARAMETERS_RDNA2,
     MMVQ_PARAMETERS_RDNA3_0,
@@ -91,6 +128,8 @@ static constexpr __device__ mmvq_parameter_table_id get_device_table_id() {
     return MMVQ_PARAMETERS_TURING;
 #elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_DGX_SPARK
     return MMVQ_PARAMETERS_GB10;
+#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_PASCAL && __CUDA_ARCH__ < GGML_CUDA_CC_VOLTA
+    return MMVQ_PARAMETERS_PASCAL;
 #else
     return MMVQ_PARAMETERS_GENERIC;
 #endif
@@ -114,6 +153,9 @@ static __host__ mmvq_parameter_table_id get_device_table_id(int cc) {
     }
     if (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_DGX_SPARK) {
         return MMVQ_PARAMETERS_GB10;
+    }
+    if (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_PASCAL && ggml_cuda_highest_compiled_arch(cc) < GGML_CUDA_CC_VOLTA) {
+        return MMVQ_PARAMETERS_PASCAL;
     }
     return MMVQ_PARAMETERS_GENERIC;
 }
@@ -404,6 +446,21 @@ static constexpr __device__ int get_mmvq_mmid_max_batch_for_device() {
 }
 
 static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_dst, mmvq_parameter_table_id table_id, bool small_k = false, bool halve_iters = false) {
+    if (type == GGML_TYPE_PQ2_0 && ncols_dst == 1 && !small_k) {
+        if (table_id == MMVQ_PARAMETERS_PASCAL) { return MANGO_PQ2_PASCAL_NW; }
+        if (table_id == MMVQ_PARAMETERS_TURING) { return MANGO_PQ2_TURING_NW; }
+    }
+    if (type == GGML_TYPE_PQ2_0 && ncols_dst == 2 && !small_k) {
+        if (table_id == MMVQ_PARAMETERS_PASCAL) { return MANGO_PQ2_PASCAL_NW2; }
+        if (table_id == MMVQ_PARAMETERS_TURING) { return MANGO_PQ2_TURING_NW2; }
+    }
+    if (table_id == MMVQ_PARAMETERS_PASCAL) {
+        switch (ncols_dst) {
+            case 1: case 2: case 3: case 4: return MANGO_PASCAL_NWARPS;
+            case 5: case 6: case 7: case 8: return 2;
+            default: return 1;
+        }
+    }
     if (table_id == MMVQ_PARAMETERS_GENERIC) {
         switch (ncols_dst) {
             case 1:
@@ -534,7 +591,22 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
     return 1;
 }
 
-static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
+static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int table_id, bool small_k = false, int nwarps = 1, ggml_type type = GGML_TYPE_COUNT) {
+    if (type == GGML_TYPE_PQ2_0 && ncols_dst == 1 && !small_k) {
+        if (table_id == MMVQ_PARAMETERS_PASCAL) { return MANGO_PQ2_PASCAL_RPB; }
+        if (table_id == MMVQ_PARAMETERS_TURING) { return MANGO_PQ2_TURING_RPB; }
+    }
+    if (type == GGML_TYPE_PQ2_0 && ncols_dst == 2 && !small_k) {
+        if (table_id == MMVQ_PARAMETERS_PASCAL) { return MANGO_PQ2_PASCAL_RPB2; }
+        if (table_id == MMVQ_PARAMETERS_TURING) { return MANGO_PQ2_TURING_RPB2; }
+    }
+    if (table_id == MMVQ_PARAMETERS_PASCAL) {
+        switch (ncols_dst) {
+            case 1: return small_k ? nwarps : MANGO_PASCAL_RPB;
+            case 2: case 3: case 4: case 5: case 6: case 7: case 8: return 2;
+            default: return 1;
+        }
+    }
     if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING || table_id == MMVQ_PARAMETERS_GB10) {
         switch (ncols_dst) {
             case 1:
@@ -552,6 +624,68 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int 
         }
     }
     return 1;
+}
+
+#define MANGO_PQ2_ALIGNED_LOADS
+// mango-code: "striped" PQ2_0 decode. One int32 of weights = 16 consecutive 2-bit weights; (w >> 2k)
+// & 0x03030303 puts weights k, k+4, k+8, k+12 in the 4 bytes as codes 0..3 - just shift + and, instead
+// of the 3 PRMT per 4 weights of the LUT. The true value is code - 1, so:
+//   dot(weights, a) = sum_k dp4a(codes_k, v_k) - sum(a)
+// where v_k are the TRANSPOSED activations (byte i of v_k = a[4i+k]) and sum(a) is the EXACT sum of the
+// q8_1 int8 values: both are computed once per chunk and reused across all rows (and the gate).
+// Bit-for-bit identical to vec_dot_pq2_0_q8_1 (integer arithmetic up to the scale).
+static __device__ __forceinline__ void mango_transpose4x4(const int a0, const int a1, const int a2, const int a3,
+                                                          int & v0, int & v1, int & v2, int & v3) {
+    const int t0 = __byte_perm(a0, a1, 0x5140);
+    const int t1 = __byte_perm(a2, a3, 0x5140);
+    const int t2 = __byte_perm(a0, a1, 0x7362);
+    const int t3 = __byte_perm(a2, a3, 0x7362);
+    v0 = __byte_perm(t0, t1, 0x5410);
+    v1 = __byte_perm(t0, t1, 0x7632);
+    v2 = __byte_perm(t2, t3, 0x5410);
+    v3 = __byte_perm(t2, t3, 0x7632);
+}
+
+template <int ncols_dst>
+static __device__ __forceinline__ void mango_pq2_0_dot(const void * __restrict__ vx, const int ib, const int kqs,
+                                                       const int (&v)[ncols_dst][8], const int (&sq)[ncols_dst],
+                                                       const float (&d8)[ncols_dst], float (&out)[ncols_dst]) {
+    const block_pq2_0 * bq = (const block_pq2_0 *) vx + ib;
+#ifdef MANGO_PQ2_ALIGNED_LOADS
+    // The block is 34 bytes: the chunk's weights are 2-aligned, not 4-aligned. Instead of 4 loads of
+    // 16 bits: 3 aligned 32-bit loads and a funnel shift (0 or 16 bits). At most 2 bytes past the
+    // chunk are read, inside the row padding that ggml allocates for quantized types.
+    const uintptr_t  a  = (uintptr_t) ((const uint8_t *) bq->qs + kqs * 8);
+    const uint32_t * p  = (const uint32_t *) (a & ~(uintptr_t) 3);
+    const uint32_t   sh = (uint32_t) (a & 2) * 8;
+    const uint32_t   wa = p[0], wb = p[1], wc = p[2];
+    const int w0 = (int) __funnelshift_r(wa, wb, sh);
+    const int w1 = (int) __funnelshift_r(wb, wc, sh);
+#else
+    const uint16_t *    qs = (const uint16_t *) bq->qs + kqs * 4;
+    const int w0 = (int) ((uint32_t) qs[0] | ((uint32_t) qs[1] << 16));
+    const int w1 = (int) ((uint32_t) qs[2] | ((uint32_t) qs[3] << 16));
+#endif
+    int sumi[ncols_dst];
+#pragma unroll
+    for (int j = 0; j < ncols_dst; ++j) {
+        sumi[j] = -sq[j];
+    }
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        const int c0 = (w0 >> (2*k)) & 0x03030303;
+        const int c1 = (w1 >> (2*k)) & 0x03030303;
+#pragma unroll
+        for (int j = 0; j < ncols_dst; ++j) {
+            sumi[j] = ggml_cuda_dp4a(c0, v[j][k + 0], sumi[j]);
+            sumi[j] = ggml_cuda_dp4a(c1, v[j][k + 4], sumi[j]);
+        }
+    }
+    const float d2 = bq->d;
+#pragma unroll
+    for (int j = 0; j < ncols_dst; ++j) {
+        out[j] = d2 * d8[j] * sumi[j];
+    }
 }
 
 template <ggml_type type, int ncols_dst, bool has_fusion, bool has_gate, bool small_k = false, bool halve_iters = false>
@@ -573,7 +707,7 @@ static __global__ void mul_mat_vec_q(
     constexpr int vdr = get_vdr_mmvq(type);
     constexpr mmvq_parameter_table_id table_id = get_device_table_id();
     constexpr int nwarps = calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters);
-    constexpr int rows_per_cuda_block = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
+    constexpr int rows_per_cuda_block = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps, type);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
@@ -716,7 +850,50 @@ static __global__ void mul_mat_vec_q(
             const int kqs = vdr * (tid % (qi/vdr));
 
 #if !defined(GGML_USE_HIP)
-        if constexpr (type == GGML_TYPE_PTQ1_0 && ncols_dst > 1 && ncols_dst <= 3) {
+        if constexpr (type == GGML_TYPE_PQ2_0 && ncols_dst <= 2 &&
+                      table_id == MMVQ_PARAMETERS_TURING) {   // measured slower on the 1080 (Pascal): 174 vs 178 GB/s
+            // mango-code: the chunk's q8_1 activations (32 values) are loaded into registers ONCE
+            // and reused across all rows of the block and the fused gate. The generic vec_dot
+            // reloads them for every row: with the ternary type (4 weights per byte) that is the bottleneck.
+            int   v[ncols_dst][8];
+            int   sq[ncols_dst];
+            float d8[ncols_dst];
+#pragma unroll
+            for (int j = 0; j < ncols_dst; ++j) {
+                const block_q8_1 * yb = &y[j * stride_col_y + kby] + kqs;
+                int u[8];
+#pragma unroll
+                for (int k = 0; k < 8; ++k) {
+                    u[k] = get_int_b4(yb->qs, k);
+                }
+                sq[j] = 0;
+#pragma unroll
+                for (int k = 0; k < 8; ++k) {
+                    sq[j] = ggml_cuda_dp4a(u[k], 0x01010101, sq[j]);
+                }
+                mango_transpose4x4(u[0], u[1], u[2], u[3], v[j][0], v[j][1], v[j][2], v[j][3]);
+                mango_transpose4x4(u[4], u[5], u[6], u[7], v[j][4], v[j][5], v[j][6], v[j][7]);
+                d8[j] = __low2float(yb->ds);
+            }
+#pragma unroll
+            for (int i = 0; i < rows_per_cuda_block; ++i) {
+                float dots[ncols_dst];
+                mango_pq2_0_dot<ncols_dst>(vx, kbx_offset + i * stride_row_x + kbx, kqs, v, sq, d8, dots);
+#pragma unroll
+                for (int j = 0; j < ncols_dst; ++j) {
+                    tmp[j][i] += dots[j];
+                }
+                if constexpr (has_fusion) {
+                    if constexpr (has_gate) {
+                        mango_pq2_0_dot<ncols_dst>(vgate, kbx_offset + i * stride_row_x + kbx, kqs, v, sq, d8, dots);
+#pragma unroll
+                        for (int j = 0; j < ncols_dst; ++j) {
+                            tmp_gate[j][i] += dots[j];
+                        }
+                    }
+                }
+            }
+        } else if constexpr (type == GGML_TYPE_PTQ1_0 && ncols_dst > 1 && ncols_dst <= 3) {
 #    pragma unroll
             for (int i = 0; i < rows_per_cuda_block; ++i) {
                 float dots[ncols_dst];
@@ -922,7 +1099,7 @@ static std::pair<dim3, dim3> calc_launch_params(
         const int ncols_dst, const int nrows_x, const int nchannels_dst, const int nsamples_or_ntokens,
         const int warp_size, const mmvq_parameter_table_id table_id, const bool small_k = false, const bool halve_iters = false) {
     const int nwarps = calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters);
-    const int rpb = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
+    const int rpb = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps, type);
     const int64_t nblocks = (nrows_x + rpb - 1) / rpb;
     const dim3 block_nums(nblocks, nchannels_dst, nsamples_or_ntokens);
     const dim3 block_dims(warp_size, nwarps, 1);

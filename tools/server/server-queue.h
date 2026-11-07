@@ -44,6 +44,7 @@ private:
     // callback functions
     std::function<bool(server_task &&, bool)> callback_new_task;
     std::function<void(void)>                 callback_update_slots;
+    std::function<void(void)>                 callback_idle; // every second while the queue is empty (disk cache)
     std::vector<std::function<void(bool)>>    callback_sleeping_state;
 
 public:
@@ -132,6 +133,11 @@ public:
     // entering sleep: queue.sleeping = true --> cb0(true) --> cb1(true) --> cb2(true)
     // leaving sleep: cb2(false) --> cb1(false) --> cb0(false) --> queue.sleeping = false
     // note: caller will hold mutex_tasks while calling the callbacks
+    // Register callback called about once a second while there are no tasks
+    void on_idle(std::function<void(void)> callback) {
+        callback_idle = std::move(callback);
+    }
+
     void on_sleeping_state(std::function<void(bool)> callback) {
         callback_sleeping_state.push_back(std::move(callback));
     }

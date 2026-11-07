@@ -84,6 +84,8 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <thread>
+#include <chrono>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -4515,7 +4517,10 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
     if (graph->graph == nullptr) {
-        if (ggml_cuda_info().devices[cuda_ctx->device].cc < GGML_CUDA_CC_VOLTA) {
+        // mango-code: GGML_CUDA_GRAPHS_ANY_ARCH=1 enables CUDA graphs on Pascal too
+        // (on Windows/WDDM the per-kernel launch overhead is the bottleneck, not the arch)
+        static const bool any_arch = getenv("GGML_CUDA_GRAPHS_ANY_ARCH") != nullptr;
+        if (!any_arch && ggml_cuda_info().devices[cuda_ctx->device].cc < GGML_CUDA_CC_VOLTA) {
             if (!graph->disable_due_to_gpu_arch) {
                 GGML_LOG_DEBUG("%s: disabling CUDA graphs due to GPU architecture\n", __func__);
             }
@@ -4527,8 +4532,13 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
 }
 #endif // USE_CUDA_GRAPH
 
+// mango-code: time of the last graph compute (us). The clock keeper runs only if it is recent: with the
+// engine idle the GPUs must be able to drop their clocks (measured: otherwise 160 W fixed for nothing).
+static std::atomic<int64_t> mango_last_compute_us{0};
+
 static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    mango_last_compute_us.store(ggml_time_us(), std::memory_order_relaxed);
 
     ggml_cuda_set_device(cuda_ctx->device);
 
@@ -5854,11 +5864,68 @@ ggml_backend_reg_t ggml_backend_cuda_reg() {
     return &reg;
 }
 
+// mango-code: CLOCK KEEPER. With the layer split the GPUs work in turn: each one sits idle for most
+// of the token and the driver drops it to P3 (measured: 3060 Ti at 720 MHz SM / 5000 MHz mem
+// instead of 2100 / 7000 during decode on 3 GPUs). Without admin the clocks cannot be locked, so the
+// GPU is kept "busy" from the inside: a single warp spinning on a lowest-priority stream. It takes
+// a fraction of one SM and no memory bandwidth; the real kernels run in parallel.
+// CUDA graph capture is in Relaxed mode, so launching from another thread is allowed.
+// Enable with GGML_CUDA_CLOCK_KEEPER=1 (or =N: duration of each kernel in microseconds).
+static __global__ void mango_clock_keeper_kernel(long long cycles) {
+    const long long t0 = clock64();
+    while (clock64() - t0 < cycles) { }
+}
+
+static void mango_clock_keeper_start(int device) {
+    static const char * env = getenv("GGML_CUDA_CLOCK_KEEPER");
+    if (env == nullptr || atoi(env) == 0) {
+        return;
+    }
+    static std::mutex mtx;
+    static bool started[GGML_CUDA_MAX_DEVICES] = {};
+    std::lock_guard<std::mutex> lock(mtx);
+    if (started[device]) {
+        return;
+    }
+    started[device] = true;
+    const int us = atoi(env) > 1 ? atoi(env) : 200;
+    std::thread([device, us]() {
+        if (cudaSetDevice(device) != cudaSuccess) {
+            return;
+        }
+        int prio_lo = 0, prio_hi = 0;
+        cudaDeviceGetStreamPriorityRange(&prio_lo, &prio_hi);
+        cudaStream_t s;
+        if (cudaStreamCreateWithPriority(&s, cudaStreamNonBlocking, prio_lo) != cudaSuccess) {
+            return;
+        }
+        int khz = 0;
+        cudaDeviceGetAttribute(&khz, cudaDevAttrClockRate, device);
+        const long long cycles = (long long) khz * us / 1000;
+        GGML_LOG_INFO("%s: clock keeper active on device %d (%d us per kernel)\n", __func__, device, us);
+        while (true) {
+            // Only while the engine works (last graph < 0.5 s ago): between requests
+            // the keeper sleeps and the GPUs go back to P8.
+            if (ggml_time_us() - mango_last_compute_us.load(std::memory_order_relaxed) > 500000) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                continue;
+            }
+            for (int i = 0; i < 4; ++i) {
+                mango_clock_keeper_kernel<<<1, 32, 0, s>>>(cycles);
+            }
+            if (cudaStreamSynchronize(s) != cudaSuccess) {
+                return;
+            }
+        }
+    }).detach();
+}
+
 ggml_backend_t ggml_backend_cuda_init(int device) {
     if (device < 0 || device >= ggml_backend_cuda_get_device_count()) {
         GGML_LOG_ERROR("%s: invalid device %d\n", __func__, device);
         return nullptr;
     }
+    mango_clock_keeper_start(ggml_cuda_info().devices[device].physical_device);
 
     ggml_backend_cuda_context * ctx = new ggml_backend_cuda_context(device);
     if (ctx == nullptr) {

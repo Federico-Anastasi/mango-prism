@@ -9,6 +9,7 @@
 
 #include "server-common.h"
 
+#include <mutex>
 #include <random>
 #include <sstream>
 #include <fstream>
@@ -1124,6 +1125,67 @@ static void handle_media(
     }
 }
 
+// The text before the first user message (system prompt and tools): the same in every conversation that
+// shares them, the disk cache keeps its state as a base. It is derived by rendering two conversations that
+// differ only in the first user message: this works for any template, without knowing how it is built.
+static std::string chat_base_prefix(const common_chat_templates * tmpls, const common_chat_templates_inputs & inputs) {
+    common_chat_templates_inputs probe = inputs;
+    probe.messages.clear();
+    for (const auto & m : inputs.messages) {
+        if (m.role != "system") {
+            break;
+        }
+        probe.messages.push_back(m);
+    }
+    probe.add_generation_prompt = false;
+
+    // two renders cost tens of ms with 20k system tokens: they are redone only when what determines them changes
+    std::string key = std::to_string(probe.enable_thinking) + std::to_string(probe.parallel_tool_calls) + std::to_string((int) probe.tool_choice);
+    for (const auto & m : probe.messages) {
+        key += '\x1f' + m.content;
+        for (const auto & p : m.content_parts) {
+            key += '\x1f' + p.text;
+        }
+    }
+    for (const auto & t : probe.tools) {
+        key += '\x1e' + t.name + '\x1f' + t.description + '\x1f' + t.parameters;
+    }
+    for (const auto & kv : probe.chat_template_kwargs) {
+        key += '\x1d' + kv.first + '=' + kv.second;
+    }
+    static std::mutex cache_mutex;
+    static std::string cache_key, cache_val;
+    {
+        std::lock_guard<std::mutex> lock(cache_mutex);
+        if (key == cache_key) {
+            return cache_val;
+        }
+    }
+
+    std::string a, b;
+    try {
+        common_chat_msg user;
+        user.role = "user";
+        user.content = "A";
+        probe.messages.push_back(user);
+        a = common_chat_templates_apply(tmpls, probe).prompt;
+        probe.messages.back().content = "B";
+        b = common_chat_templates_apply(tmpls, probe).prompt;
+    } catch (const std::exception & e) {
+        // a template that rejects the probe conversation: no base, the request goes on
+        SRV_WRN("disk cache: common prefix cannot be derived from the template: %s\n", e.what());
+        return "";
+    }
+    size_t n = 0;
+    while (n < a.size() && n < b.size() && a[n] == b[n]) {
+        ++n;
+    }
+    std::lock_guard<std::mutex> lock(cache_mutex);
+    cache_key = std::move(key);
+    cache_val = a.substr(0, n);
+    return cache_val;
+}
+
 // used by /chat/completions endpoint
 json oaicompat_chat_params_parse(
     json & body, /* openai api json semantics */
@@ -1348,6 +1410,9 @@ json oaicompat_chat_params_parse(
     }
 
     llama_params["message_delimiters"] = chat_params.message_delimiters.to_json();
+    if (opt.cache_base) {
+        llama_params["cache_base_text"] = chat_base_prefix(opt.tmpls.get(), inputs);
+    }
 
     // Reasoning budget: pass parameters through to sampling layer
     {

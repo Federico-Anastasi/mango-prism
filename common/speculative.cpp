@@ -3151,6 +3151,12 @@ common_speculative_init_result::common_speculative_init_result(
     // the draft context holds as many tokens per sequence as the target context
     cparams.n_ctx = llama_n_ctx(ctx_tgt);
 
+    // mango: LLAMA_MTP_UBATCH=N sets the ubatch of the MTP context only. The head is one layer, but copying the
+    // model's ubatch reserves a full-model compute buffer: on Qwen 3.6 at 128k, ubatch 512 -> 432 MiB, 32 -> 294 MiB.
+    if (spec_mtp && std::getenv("LLAMA_MTP_UBATCH")) {
+        cparams.n_ubatch = std::min<uint32_t>(cparams.n_ubatch, (uint32_t) std::atoi(std::getenv("LLAMA_MTP_UBATCH")));
+    }
+
     // n_rs_seq stays as common_context_params_to_llama set it: the draft context needs the same rollback window as the target, with n_rs_seq == 0 its seq_rm fails silently on partial acceptance and keeps stale positions
     cparams.ctx_other = ctx_tgt;
 

@@ -5,6 +5,7 @@
 #include "server-task.h"
 #include "server-queue.h"
 #include "server-schema.h"
+#include "server-slot-file.h"
 #include "server-stream.h"
 
 #include "build-info.h"
@@ -249,6 +250,13 @@ struct server_slot {
     slot_state state = SLOT_STATE_IDLE;
 
     server_prompt prompt;
+
+    // disk cache (server-slot-file.h)
+    slot_disk_state disk;
+
+    slot_file_view disk_view() {
+        return { ctx_tgt, ctx_dft, spec, id, mctx != nullptr, &prompt };
+    }
 
     bool prompt_save(server_prompt_cache & prompt_cache) const {
         if (prompt.tokens.size() == 0) {
@@ -645,6 +653,7 @@ struct server_slot {
             {"n_ctx",         n_ctx},
             {"speculative",   can_speculate()},
             {"is_processing", is_processing()},
+            {"n_cache_tokens", prompt.tokens.size()}, // tokens in the slot's memory (also after a restore from disk)
         };
 
         const auto & ptask = task ? task : task_prev;
@@ -654,6 +663,12 @@ struct server_slot {
             res["n_prompt_tokens"]           = (int32_t) prompt.tokens.size();
             res["n_prompt_tokens_processed"] = stats.n_prompt_processed;
             res["n_prompt_tokens_cache"]     = stats.n_prompt_cached;
+            // prompt in progress, as the TOQ engine reports it: whole prompt, read so far (cache included), time
+            if (task && state == SLOT_STATE_PROCESSING_PROMPT) {
+                res["n_prompt_tokens"] = task->n_tokens();
+                res["n_past_prompt"]   = (int32_t) prompt.tokens.size();
+                res["t_prompt_ms"]     = stats.t_start > 0 ? stats.t_elapsed_us() / 1000.0 : 0.0;
+            }
             res["params"] = ptask->params.to_json(only_metrics);
             res["next_token"] = json::array({
                 {
@@ -798,6 +813,10 @@ public:
 
     server_queue    queue_tasks;
     server_response queue_results;
+
+    // disk cache of conversations (--cache-disk), in place of the RAM cache. HTTP threads call only
+    // base_on_disk(), which looks at file names and not at the engine state.
+    std::unique_ptr<slot_disk_cache> disk_cache;
 
     // note: chat_params must not be refreshed upon existing sleeping state
     server_chat_params chat_params;
@@ -1266,6 +1285,11 @@ private:
             batch.init(std::max(n_batch, params_base.n_parallel), n_embd);
         }
 
+        if (!params_base.cache_disk.empty() && params_base.cache_ram_mib != 0) {
+            SRV_INF("%s", "prompt cache in RAM disabled: --cache-disk replaces it\n");
+            params_base.cache_ram_mib = 0;
+        }
+
         if (params_base.cache_ram_mib != 0) {
             if (params_base.cache_ram_mib < 0) {
                 SRV_TRC("prompt cache is enabled, size limit: %s\n", "no limit");
@@ -1334,6 +1358,27 @@ private:
         });
 
         metrics.init();
+
+        if (!params_base.cache_disk.empty()) {
+            disk_cache = std::make_unique<slot_disk_cache>(params_base.cache_disk, (size_t) params_base.cache_disk_mib << 20,
+                                                           (int64_t) params_base.cache_disk_hours * 3600,
+                                                           slot_file_model_fingerprint(params_base),
+                                                           ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART);
+            disk_cache->scan();
+            // the conversation open at shutdown: ready before the first request
+            auto view = slots.front().disk_view();
+            disk_cache->restore_latest(view, slots.front().disk);
+            // slot idle for a while: save it, so a shutdown or a crash does not lose the work
+            queue_tasks.on_idle([this]() {
+                const int64_t now = ggml_time_us();
+                for (auto & slot : slots) {
+                    if (!slot.is_processing() && slot.t_last_used > 0 &&
+                        now - slot.t_last_used >= slot_disk_cache::IDLE_SAVE_S * 1000000) {
+                        disk_cache->persist(slot.disk_view(), slot.disk);
+                    }
+                }
+            });
+        }
 
         if (params_base.cache_idle_slots) {
             if (params_base.cache_ram_mib == 0) {
@@ -1404,7 +1449,8 @@ private:
                 /* reasoning_budget      */ params_base.sampling.reasoning_budget_tokens,
                 /* reasoning_budget_msg  */ params_base.sampling.reasoning_budget_message,
                 /* media_path            */ params_base.media_path,
-                /* force_pure_content    */ params_base.force_pure_content_parser
+                /* force_pure_content    */ params_base.force_pure_content_parser,
+                /* cache_base            */ !params_base.cache_disk.empty()
             };
 
             {
@@ -2211,9 +2257,14 @@ private:
 
         // evict checkpoints within min-step of a previous checkpoint, unless they were
         // created by the current task
+        // with the disk cache the turn-start checkpoints stay: the next turn restarts from there
+        auto is_protected = [&](const common_prompt_checkpoint & c) {
+            return disk_cache && slot_disk_protected(slot.prompt, slot.disk, c);
+        };
+
         int64_t last = -1;
         for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ) {
-            if (it->id_task != id_task && last >= 0 && it->n_tokens <= last + params_base.checkpoint_min_step) {
+            if (it->id_task != id_task && last >= 0 && it->n_tokens <= last + params_base.checkpoint_min_step && !is_protected(*it)) {
                 SLT_TRC(slot, "erasing context checkpoint too close to an earlier one (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                         it->pos_min, it->pos_max, it->n_tokens, (float) it->size() / 1024 / 1024);
 
@@ -2226,13 +2277,17 @@ private:
         }
 
         while (slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
-            // make room for the new checkpoint, if needed
-            const auto & cur = slot.prompt.checkpoints.front();
+            // make room for the new checkpoint, if needed: the oldest one that is not protected
+            auto victim = slot.prompt.checkpoints.begin();
+            while (std::next(victim) != slot.prompt.checkpoints.end() && is_protected(*victim)) {
+                ++victim;
+            }
+            const auto & cur = *victim;
 
             SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                     cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
 
-            slot.prompt.checkpoints.erase(slot.prompt.checkpoints.begin());
+            slot.prompt.checkpoints.erase(victim);
         }
 
         auto & cur = slot.prompt.checkpoints.emplace_back();
@@ -2253,6 +2308,22 @@ private:
                 "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                 (int) slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints, cur.pos_min,
                 cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
+    }
+
+    // Disk cache before a request: the state that reuses more tokens of the prompt goes into the slot, and if the
+    // common prefix (everything before the first user message) is not on disk yet, it is saved when the prompt
+    // read reaches it.
+    void prepare_disk(server_slot & slot, const server_task & task) {
+        const size_t base_n = slot_disk_base_length(vocab, task.params.cache_base_text, task.tokens);
+        auto view = slot.disk_view();
+        disk_cache->prepare(view, slot.disk, task.tokens, base_n);
+        // A prompt that contains the whole previous prompt continues the turn (steps with tools); one that
+        // diverges earlier (a new user message, answers rendered without reasoning, another conversation)
+        // starts a new one.
+        if (slot.disk.prompt_n == 0 || slot.prompt.tokens.get_common_prefix(task.tokens) < (size_t) slot.disk.prompt_n) {
+            slot.disk.turn_n = (int32_t) task.tokens.size();
+        }
+        slot.disk.prompt_n = (int32_t) task.tokens.size();
     }
 
     // returns false to decline the task, it is offered again after the decode is done
@@ -2312,9 +2383,14 @@ private:
                             SRV_ERR("failed to launch slot with parent task, id_task = %d\n", id_task);
                             break; // drop the task
                         }
-                    } else if (!launch_slot_with_task(*slot, std::move(task))) {
-                        SRV_ERR("failed to launch slot with task, id_task = %d\n", id_task);
-                        break; // drop the task
+                    } else {
+                        if (disk_cache && task.type == SERVER_TASK_TYPE_COMPLETION) {
+                            prepare_disk(*slot, task);
+                        }
+                        if (!launch_slot_with_task(*slot, std::move(task))) {
+                            SRV_ERR("failed to launch slot with task, id_task = %d\n", id_task);
+                            break; // drop the task
+                        }
                     }
 
                     if (params_base.cache_idle_slots) {
@@ -2438,6 +2514,31 @@ private:
                         // if requested slot is unavailable, we defer this task for processing later
                         SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", task.id);
                         queue_tasks.defer(std::move(task));
+                        break;
+                    }
+
+                    if (task.slot_action.persist) {
+                        // the current state into the disk cache, if it is not there already (before shutting the engine down)
+                        if (!disk_cache) {
+                            send_error(task, "--cache-disk is not enabled", ERROR_TYPE_NOT_SUPPORTED);
+                            break;
+                        }
+                        const slot_file_result r = disk_cache->persist(slot->disk_view(), slot->disk);
+                        if (!r.ok && !r.error.empty()) {
+                            send_error(task, "slot persist failed: " + r.error, ERROR_TYPE_SERVER);
+                            break;
+                        }
+                        auto res = std::make_unique<server_task_result_slot_save_load>();
+                        res->id             = task.id;
+                        res->id_slot        = id_slot;
+                        res->is_save        = true;
+                        res->persist        = true;
+                        res->saved          = r.ok;
+                        res->n_tokens       = r.n_tokens;
+                        res->n_bytes        = r.n_bytes;
+                        res->t_ms           = r.ms;
+                        res->n_cache_tokens = slot->prompt.tokens.size();
+                        queue_results.send(std::move(res));
                         break;
                     }
 
@@ -3290,6 +3391,11 @@ private:
                             SLT_WRN(slot, "n_past was set to %d\n", n_past);
                         }
 
+                        // the prompt read restarts already past the common prefix: the base cannot be saved now
+                        if (slot.disk.base_pos >= 0 && n_past > slot.disk.base_pos) {
+                            slot.disk.base_pos = -1;
+                        }
+
                         slot.stats.n_prompt_cached    = n_past;
                         slot.stats.n_prompt_processed = 0;
 
@@ -3430,6 +3536,11 @@ private:
                             /* is_prompt = */ true);
                         slot.prompt.tokens.push_back(cur_tok);
 
+                        // end of the common prefix: after this batch the state goes to disk as the base
+                        if (slot.disk.base_pos >= 0 && slot.prompt.n_tokens() == slot.disk.base_pos) {
+                            break;
+                        }
+
                         // break at the last user message, or at user messages at least min step past the last checkpoint
                         if (do_checkpoint && spans.is_user_start(slot.prompt.n_tokens())) {
                             const auto pos = slot.prompt.n_tokens();
@@ -3511,6 +3622,12 @@ private:
                             is_last_user_message || near_prompt_end ||
                             n_tokens_start > slot.prompt.checkpoints.back().n_tokens + params_base.checkpoint_min_step);
                     SLT_DBG(slot, "main/do_checkpoint = %s, pos_min = %d, pos_max = %d\n", do_checkpoint ? "yes" : "no", pos_min, pos_max);
+
+                    // the batch starts at the end of the common prefix and is not decoded yet: the sequence
+                    // memory is exactly the base
+                    if (disk_cache && slot.disk.base_pos >= 0 && n_tokens_start == slot.disk.base_pos) {
+                        disk_cache->save_base(slot.disk_view(), slot.disk);
+                    }
 
                     // note: we create the checkpoint before calling llama_decode(), so the current batch is not
                     //       yet processed and therefore it is not part of the checkpoint.
@@ -4118,6 +4235,38 @@ struct server_res_generator : server_res_spipe {
     }
 };
 
+static bool is_warmup(const server_http_req & req) {
+    for (const auto & [k, v] : req.headers) {
+        if (k.size() == 14 && std::equal(k.begin(), k.end(), "x-mango-warmup", [](char a, char b) { return std::tolower((unsigned char) a) == b; })) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Reply to the warmup when the base is already there: no token read (timings.prompt_n = 0) and none
+// written, in the form the client asked for (a single stream chunk, or a JSON).
+static void warmup_ready(server_res_generator & res, bool stream, size_t n_base) {
+    SRV_INF("disk cache: warmup, the base of %zu tokens is already on disk\n", n_base);
+    json out = {
+        { "id",          "chatcmpl-warmup" },
+        { "object",      stream ? "chat.completion.chunk" : "chat.completion" },
+        { "created",     (int64_t) std::time(nullptr) },
+        { "model",       "warmup" },
+        { "timings",     { { "prompt_n", 0 }, { "predicted_n", 0 }, { "prompt_ms", 0.0 }, { "predicted_ms", 0.0 } } },
+        { "base_tokens", n_base },
+    };
+    res.status = 200;
+    if (stream) {
+        out["choices"]   = json::array({ { { "index", 0 }, { "delta", json::object() }, { "finish_reason", "stop" } } });
+        res.content_type = "text/event-stream";
+        res.data         = "data: " + out.dump() + "\n\ndata: [DONE]\n\n";
+    } else {
+        out["choices"] = json::array({ { { "index", 0 }, { "message", { { "role", "assistant" }, { "content", "" } } }, { "finish_reason", "stop" } } });
+        res.data       = safe_json_to_str(out);
+    }
+}
+
 void server_context::set_state_callback(server_state_callback_t callback) {
     impl->callback_state = std::move(callback);
 }
@@ -4191,6 +4340,18 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     data);
 
             task.params.message_spans = task.tokens.find_message_spans(delimiters);
+            task.params.cache_base_text = json_value(data, "cache_base_text", std::string());
+
+            // Warmup request (X-Mango-Warmup header): it only makes the engine read the common prefix.
+            // If the base is already on disk there is nothing to do: reply at once without touching the slot,
+            // which may hold the conversation to reopen.
+            if (ctx_server.disk_cache && inputs.size() == 1 && type == SERVER_TASK_TYPE_COMPLETION && is_warmup(req)) {
+                const size_t base_n = slot_disk_base_length(ctx_server.vocab, json_value(data, "cache_base_text", std::string()), task.tokens);
+                if (ctx_server.disk_cache->base_on_disk(task.tokens, base_n)) {
+                    warmup_ready(*res, json_value(data, "stream", false), base_n);
+                    return res;
+                }
+            }
 
             task.id_slot = json_value(data, "id_slot", -1);
             sse_ping_interval = task.params.sse_ping_interval;
@@ -4642,6 +4803,35 @@ void server_routes::init_routes() {
 
     this->post_slots = [this](const server_http_req & req) {
         auto res = create_response();
+        // the slot's current state into the disk cache (--cache-disk), e.g. before shutting the engine down
+        if (req.get_param("action") == "persist") {
+            int id_slot = 0;
+            try {
+                id_slot = std::stoi(req.get_param("id_slot"));
+            } catch (const std::exception &) {
+                res->error(format_error_response("Invalid slot ID", ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+            auto & rd = res->rd;
+            {
+                server_task task(SERVER_TASK_TYPE_SLOT_SAVE);
+                task.id = rd.get_new_id();
+                task.slot_action.id_slot = id_slot;
+                task.slot_action.persist = true;
+                rd.post_task(std::move(task));
+            }
+            auto result = rd.next(req.should_stop);
+            if (!result) {
+                GGML_ASSERT(req.should_stop());
+                return res;
+            }
+            if (result->is_error()) {
+                res->error(result->to_json());
+                return res;
+            }
+            res->ok(result->to_json());
+            return res;
+        }
         if (params.slot_save_path.empty()) {
             res->error(format_error_response("This server does not support slots action. Start it with `--slot-save-path`", ERROR_TYPE_NOT_SUPPORTED));
             return res;

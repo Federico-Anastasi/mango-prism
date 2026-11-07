@@ -619,6 +619,9 @@ struct common_params {
     int32_t n_ctx_checkpoints   = 32;    // max number of context checkpoints per slot
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
+    std::string cache_disk;              // disk cache of slot states (empty = off)
+    int32_t cache_disk_mib      = 6144;  // disk space cap of the disk cache
+    int32_t cache_disk_hours    = 24;    // max age of an unused state
 
     std::string hostname      = "127.0.0.1";
     std::string public_path   = "";                                                                         // NOLINT

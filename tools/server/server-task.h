@@ -94,6 +94,9 @@ struct task_params {
     // message spans for checkpointing
     common_chat_msg_spans message_spans;
 
+    // disk cache: the text before the first user message (see chat_base_prefix)
+    std::string cache_base_text;
+
     // Embeddings
     int32_t embd_normalize = 2; // (-1=none, 0=max absolute int16, 1=taxicab, 2=Euclidean/L2, >2=p-norm)
 
@@ -166,6 +169,7 @@ struct server_task {
         int id_slot;
         std::string filename;
         std::string filepath;
+        bool persist = false; // into the disk cache (--cache-disk), with no file chosen by the caller
     };
     slot_action slot_action;
 
@@ -521,6 +525,9 @@ struct server_task_result_slots : server_task_result {
 struct server_task_result_slot_save_load : server_task_result {
     std::string filename;
     bool is_save; // true = save, false = load
+    bool persist = false; // save into the disk cache: `saved` tells whether a file was written
+    bool saved   = false;
+    size_t n_cache_tokens = 0; // tokens in the slot
 
     size_t n_tokens;
     size_t n_bytes;

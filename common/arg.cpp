@@ -1710,6 +1710,27 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_RAM").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
+        {"--cache-disk"}, "DIR",
+        "keep slot states on disk in DIR across restarts and conversation switches (replaces --cache-ram)",
+        [](common_params & params, const std::string & value) {
+            params.cache_disk = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--cache-disk-mib"}, "N",
+        string_format("disk space cap for --cache-disk in MiB, least recently used out first (default: %d)", params.cache_disk_mib),
+        [](common_params & params, int value) {
+            params.cache_disk_mib = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--cache-disk-hours"}, "N",
+        string_format("drop --cache-disk states unused for N hours (default: %d)", params.cache_disk_hours),
+        [](common_params & params, int value) {
+            params.cache_disk_hours = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},
         "use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)",
