@@ -1,3 +1,21 @@
+> [!NOTE]
+> **mango-prism** is the `prism` engine of [Mango Code](https://github.com/Federico-Anastasi/mango-code): PrismML's fork of
+> llama.cpp (build b10709) plus the changes on the `mango` branch. Mango Code downloads it by itself; you only need this
+> repository to build the engine or to run it by hand.
+>
+> **What the `mango` branch adds**
+> - GTX 16xx (TU116, no tensor cores) on the dp4a kernels instead of emulated `mma` (`GGML_CUDA_TU116`).
+> - CUDA graphs on Pascal and Turing.
+> - Clock keeper (`GGML_CUDA_CLOCK_KEEPER`): keeps the GPUs from dropping their clocks between tokens when a model is split across several cards.
+> - PQ2_0 matrix-vector kernels tuned for Pascal and Turing.
+> - A separate ubatch for the MTP draft (`LLAMA_MTP_UBATCH`).
+> - Conversations saved to disk and restored (`--cache-disk`).
+>
+> **Prebuilt Windows engines** (CPU, Vulkan, CUDA 12): [release `prism-b10709-9a9394a`](https://github.com/Federico-Anastasi/mango-prism/releases/tag/prism-b10709-9a9394a).
+> Build it yourself with `mango-ci/build.ps1 -Variant cuda-12` (or `cpu`, `vulkan`).
+>
+> License: MIT, as upstream. The original README follows.
+
 # llama.cpp
 
 > [!IMPORTANT]
