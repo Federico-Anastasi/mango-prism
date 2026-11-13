@@ -10,8 +10,10 @@
 > - PQ2_0 matrix-vector kernels tuned for Pascal and Turing.
 > - A separate ubatch for the MTP draft (`LLAMA_MTP_UBATCH`).
 > - Conversations saved to disk and restored (`--cache-disk`).
+> - Models with experts (MoE) on CUDA: prompts of some lengths no longer stop the engine with an illegal memory access (the fix upstream llama.cpp has).
 >
-> **Prebuilt Windows engines** (CPU, Vulkan, CUDA 12): [release `prism-b10709-9a9394a`](https://github.com/Federico-Anastasi/mango-prism/releases/tag/prism-b10709-9a9394a).
+> **Prebuilt Windows engines** (CPU, Vulkan, CUDA 12): [release `prism-b10709-9a9394a-r2`](https://github.com/Federico-Anastasi/mango-prism/releases/tag/prism-b10709-9a9394a-r2).
+> A release name is the upstream build and commit the branch starts from; `-r2` is the second release from the same upstream commit.
 > Build it yourself with `mango-ci/build.ps1 -Variant cuda-12` (or `cpu`, `vulkan`).
 >
 > License: MIT, as upstream. The original README follows.
