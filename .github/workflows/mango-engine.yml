@@ -1,6 +1,7 @@
 name: Mango engine (Windows)
 
-# Builds the `prism` engine for Windows (CPU, Vulkan, CUDA 12) and, on a `prism-*` tag, publishes the zips
+# Builds the `prism` engine for Windows (CPU, Vulkan, CUDA 12, and CUDA 12 for a PC with a GTX 16xx) and, on a
+# `prism-*` tag, publishes the zips
 # in a release. The build options live in mango-ci/build.ps1, the same script `launcher\setup.ps1 -Only
 # llama-prism` uses in the mango-code repo.
 # Run by hand (workflow_dispatch) it builds and uploads the zips as artifacts, without a release.
@@ -25,12 +26,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        variant: [cpu, vulkan, cuda-12]
+        variant: [cpu, vulkan, cuda-12, cuda-12-gtx16]
     steps:
       - uses: actions/checkout@v6
 
       - name: CUDA 12.4
-        if: matrix.variant == 'cuda-12'
+        if: startsWith(matrix.variant, 'cuda-12')
         uses: ./.github/actions/windows-setup-cuda
         with:
           cuda_version: "12.4"
